@@ -129,6 +129,32 @@ class RevertDocument(StrictModel):
     author: Optional[str] = Field(default=None, max_length=200)
 
 
+class ImpactPreview(StrictModel):
+    """变更影响预演：不落库地预演一次 PATCH 对各根文档解析视图的影响。
+
+    只读接口，不携带 ``request_id`` / ``author`` / ``guards`` / ``lease_token``：
+    不创建修订、不占用幂等 ID、不改变租约。
+    """
+
+    base_revision: int = Field(
+        ..., ge=1, description="来稿所基于的修订号（与 PATCH 语义相同）"
+    )
+    patch: Any = Field(..., description="RFC 7386 JSON Merge Patch")
+    root_document_ids: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=20,
+        description="需要预演解析影响的根文档 ID 列表（1～20 个；重复项按首次出现去重）",
+    )
+
+    @field_validator("patch")
+    @classmethod
+    def _json_only(cls, v: Any) -> Any:
+        if not isinstance(v, _JSON_TYPES):
+            raise ValueError("patch 必须是合法的 JSON 值")
+        return v
+
+
 class SetContract(StrictModel):
     # JSON Schema 根必须是对象或布尔（true/false 布尔 Schema）；
     # 进一步的合法性（关键字、$ref 等）由 validation.check_schema 做元校验。

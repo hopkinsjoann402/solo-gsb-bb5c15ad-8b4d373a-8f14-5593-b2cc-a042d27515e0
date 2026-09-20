@@ -83,6 +83,19 @@
 - 文档 / 修订 / 指针不存在 → `422` 及从根文档出发的完整引用链；
 - 依赖成环 → `409` 及首尾闭合的环链；最大解析深度为 32。
 
+提交前想确认"这个 patch 会影响哪些引用我的配置视图"时，可用
+**`POST /documents/{id}/impact-preview` 变更影响预演**：请求携带
+`base_revision`、`patch` 与 1～20 个 `root_document_ids`，服务端在
+**同一个 SQLite 读事务快照**内先按现有三方合并与契约规则生成**不落库候选**，
+再分别以当前内容和候选覆盖目标文档、递归解析每个根文档的 `$ref`：
+
+- 候选冲突 / 契约失败 / 基线无效 → 整体返回与 PATCH 相同的结构化错误；
+- 每个根返回固定修订、两遍解析的依赖并集与按差异审计语义排序的
+  `resolved_changes`；单个根解析失败仅在该根结果中记录引用链错误，
+  不影响其他根；重复根按首次出现去重；
+- 预演为只读分析：**不创建修订、不占用 `request_id`、不改变租约**
+  （也不检查租约与 guards）。
+
 ## 一键启动
 
 需要 Docker 与 Docker Compose v2：
@@ -142,6 +155,7 @@ docker compose down -v       # 停止并删除数据卷
 | `GET` | `/documents/{id}/diff` | 比较两个修订快照（`from_revision`/`to_revision`），返回按 RFC 6901 路径排序的 add/remove/replace 差异 |
 | `GET` | `/documents/{id}/blame` | 历史字段归因（`revision` 指定目标快照）：每个叶子值最后由哪次修订改变 |
 | `GET` | `/documents/{id}/resolved` | 跨文档引用解析（`revision` 可选，默认 `current`），返回 `resolved` 与去重依赖清单 |
+| `POST` | `/documents/{id}/impact-preview` | 变更影响预演（只读）：生成不落库候选，对比各根文档当前 / 候选两遍解析结果 |
 | `PUT` | `/documents/{id}/schema` | 设置 / 替换 JSON Schema 2020-12 契约 |
 | `GET` | `/documents/{id}/schema` | 查询当前契约（未设置返回 `404 schema_not_found`） |
 | `DELETE` | `/documents/{id}/schema` | 删除契约（幂等，删除后恢复原更新行为） |
@@ -821,6 +835,91 @@ HTTP/1.1 409 Conflict
 
 `chain` 只含环本身：链首与链尾是同一个 (文档, 修订, 指针)，首尾闭合。
 
+## 变更影响预演（POST /documents/{id}/impact-preview）
+
+只读接口：在**同一个 SQLite 读事务快照**内回答"如果现在提交这个 patch，
+哪些根文档的解析视图会发生什么变化"。请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `base_revision` | 来稿所基于的修订号（与 PATCH 语义相同） |
+| `patch` | RFC 7386 JSON Merge Patch |
+| `root_document_ids` | 1～20 个根文档 ID；重复项按首次出现去重 |
+
+服务端先按现有三方合并与契约规则生成**不落库候选**（与 PATCH 相同的
+基线检查 / 三方重放 / 契约校验），再对每个根文档做两遍 `$ref` 解析：
+一遍用当前内容，一遍用候选覆盖目标文档。候选视为目标文档的**下一个修订**：
+`@current` 引用在候选解析中固定到 `candidate_revision` 并读到候选内容，
+`@<历史修订>` 的固定引用始终读历史快照，不受候选影响。
+
+```bash
+# dep: {"host": "a", "port": 5432}（当前 rev1）
+# app: {"db": {"$ref": "doc:dep@current#"}, "debug": false}
+curl -X POST http://localhost:8000/documents/dep/impact-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"base_revision": 1, "patch": {"host": "b"}, "root_document_ids": ["app"]}'
+```
+
+```json
+{
+  "id": "dep",
+  "base_revision": 1,
+  "current_revision": 1,
+  "candidate_revision": 2,
+  "replayed": false,
+  "changed": true,
+  "candidate": {"host": "b", "port": 5432},
+  "results": [
+    {
+      "root_document_id": "app",
+      "revision": 1,
+      "dependencies": [
+        {"document_id": "dep", "revision": 1, "pointer": ""},
+        {"document_id": "dep", "revision": 2, "pointer": ""}
+      ],
+      "resolved_changes": [
+        {"op": "replace", "path": "/db/host", "before": "a", "after": "b", "missing": []}
+      ]
+    }
+  ]
+}
+```
+
+响应字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `current_revision` | 快照内固定的目标文档当前修订 |
+| `candidate_revision` | 候选若落库将占用的修订号：`changed` 时为 `current_revision + 1`，否则等于 `current_revision`（与 PATCH 的 changed 语义一致） |
+| `replayed` / `changed` / `candidate` | 与 PATCH 相同的三方合并标记与最终候选内容（不落库） |
+| `results[].revision` | 根文档在快照内固定的修订 |
+| `results[].dependencies` | 两遍解析依赖的**并集**：按首次遍历排序（当前解析在前）、按 (文档, 修订, 指针) 去重；候选解析中目标文档的 `@current` 依赖以 `candidate_revision` 给出 |
+| `results[].resolved_changes` | 当前解析 → 候选解析的差异，与 `GET /documents/{id}/diff` 同一语义（add/remove/replace、按 RFC 6901 路径排序、`missing` 区分键缺失与真实 `null`） |
+
+错误语义：
+
+- 候选生成失败（`404 not_found`、`422 unknown_base_revision`、
+  `409 conflict`、`422 schema_validation_failed`）→ **整体**返回与 PATCH
+  相同的结构化错误（预演无 `request_id` 字段），不返回任何根结果；
+- 单个根解析失败 → 仅该根的结果为错误项，其他根不受影响：
+
+  ```json
+  {"root_document_id": "app", "phase": "candidate",
+   "error": "pointer_not_found", "status_code": 422,
+   "document_id": "dep", "revision": 2, "pointer": "/host",
+   "reason": "指针在目标修订中不存在",
+   "chain": [
+     {"document_id": "app", "revision": 1, "pointer": "", "ref": null, "at": null},
+     {"document_id": "dep", "revision": 2, "pointer": "/host",
+      "ref": "doc:dep@current#/host", "at": "/db"}
+   ]}
+  ```
+
+  `phase` 区分失败发生在哪一遍：`current`（当前内容已无法解析，
+  预演基线缺失）或 `candidate`（候选引入的解析失败——正是预演要发现的影响）；
+- 预演为**只读**分析：不创建修订、不占用 `request_id`、不改变租约，
+  也不检查租约与 guards；同一预演重复执行不会产生任何副作用。
+
 ## JSON Schema 契约（可选）
 
 每个文档最多一个契约，遵循 [JSON Schema 2020-12](https://json-schema.org/draft/2020-12)
@@ -973,7 +1072,7 @@ HTTP/1.1 422 Unprocessable Entity
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由与更新编排（事务、幂等、guards、写入租约、冲突响应、契约接口、差异审计、字段归因、引用解析）
+│   ├── main.py        # FastAPI 路由与更新编排（事务、幂等、guards、写入租约、冲突响应、契约接口、差异审计、字段归因、引用解析、变更影响预演）
 │   ├── merge.py       # RFC 7386 打补丁 + 递归三方合并（无框架依赖，可单测）
 │   ├── guards.py      # 更新前置条件求值（RFC 6901 指针 + 等值/缺失检查，无框架依赖，可单测）
 │   ├── diff.py        # 两快照递归差异审计（add/remove/replace，无框架依赖，可单测）
@@ -992,6 +1091,7 @@ HTTP/1.1 422 Unprocessable Entity
 │   ├── test_diff.py      # GET /documents/{id}/diff 差异审计集成测试（17 例）
 │   ├── test_blame.py     # GET /documents/{id}/blame 历史字段归因集成测试（24 例）
 │   ├── test_resolve.py   # GET /documents/{id}/resolved 引用解析集成测试（33 例）
+│   ├── test_impact_preview.py # POST /documents/{id}/impact-preview 变更影响预演集成测试（24 例）
 │   ├── test_guards.py    # guards 前置条件与发布项 guards 集成测试（27 例）
 │   └── test_leases.py    # 写入租约（获取/续期/释放/查询 + PATCH/发布门禁）集成测试（29 例）
 ├── Dockerfile

@@ -1,4 +1,4 @@
-"""FastAPI 入口：文档创建 / 读取 / 修订历史 / 修订差异 / 字段归因 / 引用解析 / 带三方合并的更新 / 写入租约。"""
+"""FastAPI 入口：文档创建 / 读取 / 修订历史 / 修订差异 / 字段归因 / 引用解析 / 变更影响预演 / 带三方合并的更新 / 写入租约。"""
 from __future__ import annotations
 
 import hashlib
@@ -28,6 +28,7 @@ from .schemas import (
     CreateDocument,
     CreateRelease,
     Guard,
+    ImpactPreview,
     ReleaseLease,
     RenewLease,
     RevertDocument,
@@ -46,12 +47,13 @@ async def lifespan(app: FastAPI) -> Iterator[None]:
 
 app = FastAPI(
     title="共享 JSON 配置三方合并 API",
-    version="1.7.0",
+    version="1.8.0",
     description="基于 JSON Merge Patch (RFC 7386) 的共享配置存储；"
     "基线过期时递归三方合并，路径冲突返回 409；支持按修订号逆向撤销；"
     "支持任意两修订间的递归差异审计；"
     "支持历史字段归因（目标快照每个叶子值最后由哪次修订改变）；"
     "支持跨文档 $ref 引用解析（同一读事务快照内固定全部修订）；"
+    "支持变更影响预演（不落库候选 + 各根文档当前/候选解析对比，只读）；"
     "支持更新前置条件 guards（写事务内先检查当前修订，未满足返回 409）；"
     "支持文档级临时写入租约（fencing token 全局严格递增，过期后旧 token 永久失效）。",
     lifespan=lifespan,
@@ -142,22 +144,27 @@ def _prepare_candidate(
     doc_id: str,
     base_revision: int,
     patch: Any,
-    request_id: str,
+    request_id: str | None,
     *,
     lease_token: int | None = None,
     guards: list[Guard] | None = None,
+    check_lease: bool = True,
     conflict_error: str = "conflict",
     conflict_extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """写事务内执行「租约 → guards → 基线 → Merge Patch → 三方合并 → 契约校验」的只读流程。
+    """执行「租约 → guards → 基线 → Merge Patch → 三方合并 → 契约校验」的只读流程。
 
     返回落库所需的候选结果，不写入任何数据，也不登记幂等记录；
     调用方负责插入修订 / 回滚。*conflict_error* / *conflict_extra* 允许撤销
     接口把同一种三方分歧渲染成自己的 ``revert_conflict`` 错误体。
+    变更影响预演在同一**读事务**内复用本流程生成不落库候选：
+    此时 *request_id* 为 None（错误体不含该字段）且 *check_lease* 为 False
+    （预演只读，不检查也不改变租约）。
 
     顺序：
     ⓪ 文档存在未过期租约时，请求必须携带匹配的 *lease_token*
-      （否则 ``lease_conflict`` 409；无有效租约时携带 token 同样拒绝）；
+      （否则 ``lease_conflict`` 409；无有效租约时携带 token 同样拒绝；
+      *check_lease* 为 False 时整步跳过）；
     ① 声明了 *guards* 时，按输入顺序逐条检查**当前修订**
       （任一未通过 → ``precondition_failed`` 409，列出全部未通过项）；
     ② 基线必须存在（``unknown_base_revision``）；
@@ -170,10 +177,11 @@ def _prepare_candidate(
         raise _ItemError("not_found", status.HTTP_404_NOT_FOUND, document_id=doc_id)
 
     # 第〇步：写入租约——存在未过期租约时仅匹配当前 fencing token 的请求可写入。
-    # 失败由调用方回滚：不写修订、不占用幂等 ID。
-    _enforce_lease(
-        conn, doc_id, lease_token, request_id=request_id, base_revision=base_revision
-    )
+    # 失败由调用方回滚：不写修订、不占用幂等 ID。只读预演跳过本步。
+    if check_lease:
+        _enforce_lease(
+            conn, doc_id, lease_token, request_id=request_id, base_revision=base_revision
+        )
 
     current_revision = doc["current_revision"]
     current_content = json.loads(
@@ -219,13 +227,16 @@ def _prepare_candidate(
         merged, raw_conflicts = three_way_merge(base_content, current_content, theirs)
         replayed = True
         if raw_conflicts:
-            detail: dict[str, Any] = {
-                "document_id": doc_id,
-                "request_id": request_id,
-                "base_revision": base_revision,
-                "current_revision": current_revision,
-                "conflicts": [present_conflict(c) for c in raw_conflicts],
-            }
+            detail: dict[str, Any] = {"document_id": doc_id}
+            if request_id is not None:
+                detail["request_id"] = request_id
+            detail.update(
+                {
+                    "base_revision": base_revision,
+                    "current_revision": current_revision,
+                    "conflicts": [present_conflict(c) for c in raw_conflicts],
+                }
+            )
             if conflict_extra:
                 detail = {**conflict_extra, **detail}
             raise _ItemError(conflict_error, status.HTTP_409_CONFLICT, **detail)
@@ -237,14 +248,20 @@ def _prepare_candidate(
         contract_schema = json.loads(contract_row["schema_json"])
         schema_errors = validate_instance(contract_schema, merged)
         if schema_errors:
+            detail = {"document_id": doc_id}
+            if request_id is not None:
+                detail["request_id"] = request_id
+            detail.update(
+                {
+                    "base_revision": base_revision,
+                    "current_revision": current_revision,
+                    "errors": schema_errors,
+                }
+            )
             raise _ItemError(
                 "schema_validation_failed",
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
-                document_id=doc_id,
-                request_id=request_id,
-                base_revision=base_revision,
-                current_revision=current_revision,
-                errors=schema_errors,
+                **detail,
             )
 
     changed = db.canonical(merged) != db.canonical(current_content)
@@ -655,6 +672,164 @@ def get_resolved_document(
         "revision": root_revision,
         "resolved": resolved,
         "dependencies": dependencies,
+    }
+
+
+# ---------------------------------------------------------------- 变更影响预演
+
+
+def _union_dependencies(
+    first: list[dict[str, Any]], second: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """合并两遍解析的依赖清单：保持首次遍历顺序（当前解析在前），
+    按 (文档, 修订, 指针) 去重。"""
+    merged = list(first)
+    seen = {(d["document_id"], d["revision"], d["pointer"]) for d in first}
+    for dep in second:
+        key = (dep["document_id"], dep["revision"], dep["pointer"])
+        if key not in seen:
+            seen.add(key)
+            merged.append(dep)
+    return merged
+
+
+def _preview_root_error(
+    root_id: str, phase: str, exc: ResolutionError
+) -> dict[str, Any]:
+    """把单个根的解析失败整理成结果项（不影响其他根）。
+
+    *phase* 指出失败发生在哪一遍：``current``（当前内容已无法解析，
+    预演基线缺失）或 ``candidate``（候选引入的解析失败）。
+    """
+    return {
+        "root_document_id": root_id,
+        "phase": phase,
+        "error": exc.code,
+        "status_code": exc.status_code,
+        **exc.extra,
+        "chain": exc.chain,
+    }
+
+
+def _impact_preview_root(
+    conn: sqlite3.Connection,
+    target_id: str,
+    root_id: str,
+    candidate: Any,
+    changed: bool,
+    candidate_revision: int,
+) -> dict[str, Any]:
+    """对单个根文档做「当前内容 / 候选覆盖目标文档」两遍 $ref 解析并给出差异。
+
+    候选解析中目标文档的当前修订呈现为 *candidate_revision*（候选若落库将占用
+    的修订号）：``@current`` 引用读到候选内容，``@<历史修订>`` 的固定引用始终
+    读历史快照。任一遍失败 → 返回携带完整引用链的错误项，不影响其他根。
+    """
+    try:
+        resolved_current, root_revision, deps_current = resolve_document(
+            root_id,
+            "current",
+            lambda target: _current_revision_or_none(conn, target),
+            lambda target, rev: _revision_content_or_none(conn, target, rev),
+        )
+    except ResolutionError as exc:
+        return _preview_root_error(root_id, "current", exc)
+
+    if not changed:
+        # 候选与当前内容一致：两遍解析必然相同，无需第二遍
+        return {
+            "root_document_id": root_id,
+            "revision": root_revision,
+            "dependencies": deps_current,
+            "resolved_changes": [],
+        }
+
+    def pinned_current(target: str) -> int | None:
+        # 候选视为目标文档的下一个修订：@current 引用在候选解析中固定到它
+        if target == target_id:
+            return candidate_revision
+        return _current_revision_or_none(conn, target)
+
+    def content_or_candidate(target: str, revision: int) -> Any:
+        if target == target_id and revision == candidate_revision:
+            return candidate
+        return _revision_content_or_none(conn, target, revision)
+
+    try:
+        resolved_candidate, _, deps_candidate = resolve_document(
+            root_id, "current", pinned_current, content_or_candidate
+        )
+    except ResolutionError as exc:
+        return _preview_root_error(root_id, "candidate", exc)
+
+    return {
+        "root_document_id": root_id,
+        "revision": root_revision,
+        "dependencies": _union_dependencies(deps_current, deps_candidate),
+        "resolved_changes": snapshot_diff(resolved_current, resolved_candidate),
+    }
+
+
+@app.post("/documents/{doc_id}/impact-preview", tags=["documents"])
+def impact_preview(
+    doc_id: str,
+    body: ImpactPreview,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """变更影响预演：只读地预演一次 PATCH 对各根文档解析视图的影响。
+
+    * 在**同一个 SQLite 读事务快照**内：先按现有三方合并与契约规则生成
+      **不落库候选**（与 PATCH 相同的基线检查 / 三方重放 / 契约校验），
+      再分别以当前内容和候选覆盖目标文档，递归解析每个根文档的 ``$ref``；
+    * 候选冲突 / 契约失败 / 基线无效 / 文档不存在 → 整体返回与 PATCH
+      相同的结构化错误（无 ``request_id`` 字段），不返回任何根结果；
+    * 每个根返回固定修订、两遍解析的依赖并集与按差异审计语义排序的
+      ``resolved_changes``；单个根解析失败仅在该根结果中记录引用链错误，
+      不影响其他根；重复根按首次出现去重；
+    * 预演为只读分析：**不创建修订、不占用 request_id、不改变租约**
+      （也不检查租约与 guards）。
+    """
+    # 重复根按首次出现去重
+    root_ids = list(dict.fromkeys(body.root_document_ids))
+
+    # 只读事务（WAL 快照）：候选生成与全部根的两遍解析看到一致的内容，
+    # 且不产生任何写入（不创建修订、不占用 request_id、不改变租约）。
+    with db.read_transaction(conn):
+        try:
+            result = _prepare_candidate(
+                conn,
+                doc_id,
+                body.base_revision,
+                body.patch,
+                request_id=None,
+                check_lease=False,
+            )
+        except _ItemError as exc:
+            raise err(exc.status_code, exc.code, **exc.extra)
+
+        candidate = result["merged"]
+        changed = result["changed"]
+        current_revision = result["current_revision"]
+        # 候选若落库将占用的修订号（与 PATCH 的 changed 语义一致）；
+        # 候选覆盖解析时，目标文档的 @current 引用固定到该虚拟修订。
+        candidate_revision = current_revision + 1 if changed else current_revision
+
+        results = [
+            _impact_preview_root(
+                conn, doc_id, root_id, candidate, changed, candidate_revision
+            )
+            for root_id in root_ids
+        ]
+
+    return {
+        "id": doc_id,
+        "base_revision": body.base_revision,
+        "current_revision": current_revision,
+        "candidate_revision": candidate_revision,
+        "replayed": result["replayed"],
+        "changed": changed,
+        "candidate": candidate,
+        "results": results,
     }
 
 
