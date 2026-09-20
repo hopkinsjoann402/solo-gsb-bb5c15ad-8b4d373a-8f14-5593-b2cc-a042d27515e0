@@ -1,6 +1,7 @@
 """请求/响应 Pydantic 模型。"""
 from __future__ import annotations
 
+import re
 from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -127,6 +128,43 @@ class RevertDocument(StrictModel):
         description="调用方生成的去重 ID（如 UUID），同 ID+同内容幂等",
     )
     author: Optional[str] = Field(default=None, max_length=200)
+
+
+# ---------------------------------------------------------------- 变更影响预演
+
+
+class ImpactPreview(StrictModel):
+    """变更影响预演请求：不落库候选 + 逐根文档引用解析（纯只读）。"""
+
+    base_revision: int = Field(
+        ..., ge=1, description="来稿所基于的目标文档修订号"
+    )
+    patch: Any = Field(..., description="RFC 7386 JSON Merge Patch（不落库）")
+    root_document_ids: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=20,
+        description="1～20 个根文档 ID；重复 ID 按首次出现去重",
+    )
+
+    @field_validator("patch")
+    @classmethod
+    def _json_only(cls, v: Any) -> Any:
+        if not isinstance(v, _JSON_TYPES):
+            raise ValueError("patch 必须是合法的 JSON 值")
+        return v
+
+    @field_validator("root_document_ids")
+    @classmethod
+    def _valid_doc_ids(cls, values: list[str]) -> list[str]:
+        doc_id_re = r"^[A-Za-z0-9][A-Za-z0-9._~-]*$"
+        for value in values:
+            if not re.fullmatch(doc_id_re, value):
+                raise ValueError(
+                    "root_document_ids 必须是合法文档 ID（字母数字开头，"
+                    "仅含字母数字及 . _ ~ -）"
+                )
+        return values
 
 
 class SetContract(StrictModel):
